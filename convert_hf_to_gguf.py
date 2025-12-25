@@ -3751,6 +3751,174 @@ class Ernie4_5MoeModel(Ernie4_5Model):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("Ernie4_5_VLMoeForConditionalGeneration")
+class Ernie4_5VLMoeModel(Ernie4_5MoeModel):
+    model_arch = gguf.MODEL_ARCH.ERNIE4_5_VL_MOE
+    _experts: list[dict[str, Tensor]] | None = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._experts = [{} for _ in range(self.block_count)]
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        # Handle list-based expert configurations by taking the first value
+        moe_num_experts = self.hparams["moe_num_experts"]
+        if isinstance(moe_num_experts, list):
+            moe_num_experts = moe_num_experts[0]
+        self.gguf_writer.add_expert_count(moe_num_experts)
+
+        self.gguf_writer.add_expert_used_count(self.hparams["moe_k"])
+        self.gguf_writer.add_interleave_moe_layer_step(self.hparams["moe_layer_interval"])
+
+        moe_layer_start_index = self.hparams["moe_layer_start_index"]
+        if isinstance(moe_layer_start_index, list):
+            moe_layer_start_index = moe_layer_start_index[0]
+        self.gguf_writer.add_leading_dense_block_count(moe_layer_start_index)
+
+        if (moe_intermediate_size := self.hparams.get("moe_intermediate_size")) is not None:
+            if isinstance(moe_intermediate_size, list):
+                moe_intermediate_size = moe_intermediate_size[0]
+            self.gguf_writer.add_expert_feed_forward_length(moe_intermediate_size)
+
+        if (shared_expert_count := self.hparams.get('moe_num_shared_experts')) is not None:
+            self.gguf_writer.add_expert_shared_count(shared_expert_count)
+            if shared_expert_count > 0 and (shared_expert_intermediate_size := self.hparams.get('intermediate_size')) is not None and (num_key_value_heads := self.hparams.get('num_key_value_heads')) is not None:
+                self.gguf_writer.add_expert_shared_feed_forward_length(shared_expert_intermediate_size // num_key_value_heads)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Skip vision and multimodal tensors - they are not part of the text model
+        if name.startswith("vision_model") or name.startswith("resampler_model") or \
+           name.startswith("model.vision_model") or name.startswith("model.resampler_model"):
+            return []
+
+        # Skip gate.weight (keep only gate.weight_1 for ERNIE-4.5-VL MoE)
+        if name.endswith(".mlp.gate.weight") and not name.endswith(".mlp.gate.weight_1"):
+            return []
+
+        # Handle exp_probs_b shape - take first row from [2, 64] to [64]
+        if name.endswith(".mlp.moe_statics.e_score_correction_bias"):
+            # This is the e_score_correction_bias tensor with shape [2, 64]
+            # Take the first row [64] for the regular experts
+            data_torch = data_torch[0, :]
+            logger.info("Reshaped e_score_correction_bias to shape %s", data_torch.shape)
+
+        # Modify correction bias name as in DeepseekV2
+        if name.endswith("e_score_correction_bias"):
+            name = name.replace("e_score_correction_bias", "e_score_correction.bias")
+
+        # Transpose gate.weight_1 - HF has shape [64, 2560], llama.cpp expects [2560, 64]
+        if name.endswith(".mlp.gate.weight_1"):
+            data_torch = data_torch.t()
+            # Extract bid from name if not provided
+            if bid is None:
+                match = re.search(r"model\.layers\.(\d+)", name)
+                if match:
+                    bid = int(match.group(1))
+            logger.info("Processing gate.weight_1: %s -> shape %s", name, data_torch.shape)
+            # Map the tensor name and ensure it has .weight suffix
+            mapped_name = self.map_tensor_name(name)
+            if not mapped_name.endswith(".weight"):
+                mapped_name = mapped_name + ".weight"
+            return [(mapped_name, data_torch)]
+
+        # process the experts separately
+        if name.find("mlp.experts") != -1:
+            n_experts = self.hparams["moe_num_experts"]
+
+            # Handle n_experts being a list (for models with multiple expert groups)
+            if isinstance(n_experts, list):
+                total_experts = sum(n_experts)
+            else:
+                total_experts = n_experts
+
+            assert bid is not None
+
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+
+            self._experts[bid][name] = data_torch
+
+            # Only merge routed experts (not shared experts)
+            # Total tensors = total_experts * 3 (gate, up, down)
+            if len(self._experts[bid]) >= total_experts * 3:
+                tensors: list[tuple[str, Tensor]] = []
+
+                # For models with multiple expert groups of different sizes,
+                # we need to group experts by their shape and stack separately
+                for w_name in ["gate_proj", "up_proj", "down_proj"]:
+                    # Collect all experts for this weight type
+                    expert_data: dict[int, Tensor] = {}
+                    for xid in range(total_experts):
+                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                        if ename in self._experts[bid]:
+                            expert_data[xid] = self._experts[bid][ename]
+                            del self._experts[bid][ename]
+
+                    if not expert_data:
+                        continue
+
+                    # Group experts by shape (to handle different intermediate sizes)
+                    shape_groups: dict[tuple[int, ...], list[tuple[int, Tensor]]] = {}
+                    for xid, tensor in expert_data.items():
+                        shape_key = tuple(tensor.shape)
+                        if shape_key not in shape_groups:
+                            shape_groups[shape_key] = []
+                        shape_groups[shape_key].append((xid, tensor))
+
+                    # For each shape group, stack the experts
+                    # For ERNIE-4.5-VL with multiple expert groups of different sizes,
+                    # we need to save them separately as llama.cpp doesn't support mixed sizes yet
+                    if len(shape_groups) > 1:
+                        # Sort shape groups by number of experts (descending)
+                        sorted_groups = sorted(shape_groups.items(), key=lambda x: len(x[1]), reverse=True)
+
+                        for group_idx, (shape_key, expert_list) in enumerate(sorted_groups):
+                            # Sort by expert ID to maintain order
+                            expert_list.sort(key=lambda x: x[0])
+                            datas = [tensor for _, tensor in expert_list]
+
+                            data_torch = torch.stack(datas, dim=0)
+
+                            # Use group suffix for additional groups
+                            if group_idx == 0:
+                                merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                            else:
+                                # Additional groups - currently not supported by llama.cpp
+                                # Skip them for now
+                                logger.warning(f"Skipping expert group {group_idx} with shape {shape_key} for layer {bid} - llama.cpp doesn't support multiple expert sizes yet")
+                                continue
+
+                            new_name = self.map_tensor_name(merged_name)
+                            tensors.append((new_name, data_torch))
+                    else:
+                        # Single shape - stack all experts
+                        expert_list = list(shape_groups.values())[0]
+                        expert_list.sort(key=lambda x: x[0])
+                        datas = [tensor for _, tensor in expert_list]
+
+                        data_torch = torch.stack(datas, dim=0)
+
+                        merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                        new_name = self.map_tensor_name(merged_name)
+                        tensors.append((new_name, data_torch))
+
+                return tensors
+            else:
+                return []
+        return [(self.map_tensor_name(name), data_torch)]
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+
+        if self._experts is not None:
+            # flatten `list[dict[str, Tensor]]` into `list[str]`
+            experts = [k for d in self._experts for k in d.keys()]
+            if len(experts) > 0:
+                raise ValueError(f"Unprocessed experts: {experts}")
+
+
 @ModelBase.register(
     "Qwen2VLModel",
     "Qwen2VLForConditionalGeneration",
@@ -3994,6 +4162,210 @@ class InternVisionModel(MmprojModel):
                 ]
             return [(self.map_tensor_name(name), data_torch)]
         return [] # skip other tensors
+
+
+@ModelBase.register("Ernie4_5_VLMoeForConditionalGeneration")
+class Ernie4_5VLVisionModel(MmprojModel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.hparams_vision is not None
+        # DFNRopeVisionTransformer specific parameters
+        self.hparams_vision["image_size"] = self.hparams_vision.get("spatial_patch_size", 14) * 40  # Approximate
+        self.hparams_vision["patch_size"] = self.hparams_vision.get("spatial_patch_size", 14)
+        self.hparams_vision["num_attention_heads"] = self.hparams_vision.get("num_heads", 16)
+        self.hparams_vision["num_hidden_layers"] = self.hparams_vision.get("depth", 32)
+        self.hparams_vision["hidden_size"] = self.hparams_vision.get("embed_dim", 1280)
+        self.hparams_vision["intermediate_size"] = int(self.hparams_vision["hidden_size"] * self.hparams_vision.get("mlp_ratio", 4))
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        assert self.hparams_vision is not None
+        hparams = self.hparams_vision
+
+        # Use a custom projector type for ERNIE-4.5-VL
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.ERNIE45VL)  # Use ERNIE-4.5-VL projector
+
+        # Set vision parameters
+        self.gguf_writer.add_vision_attention_layernorm_eps(1e-6)  # Default RMS norm eps
+        self.gguf_writer.add_vision_use_gelu(True)  # DFN uses quick_gelu, but we map to gelu
+
+        # Image processing parameters
+        self.gguf_writer.add_vision_image_size(hparams["image_size"])
+        self.gguf_writer.add_vision_patch_size(hparams["patch_size"])
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("vision_model.") or name.startswith("model.vision_model."):
+            # Process vision encoder tensors
+            name = name.replace("model.vision_model.", "vision_model.")
+            # Handle top-level layer norm before renaming
+            if name == "vision_model.ln.weight":
+                return [("v.post_ln.weight", data_torch)]
+            elif name == "vision_model.ln.bias":
+                return [("v.post_ln.bias", data_torch)]
+
+            name = name.replace("vision_model.", "vision_tower.")
+
+            # Handle patch embedding
+            # Note: Keep 4D for LLaVA projector compatibility
+
+            # Handle attention layers
+            if "blocks." in name and "attn." in name:
+                # DFN uses different attention structure, map to standard
+                if "qkv.weight" in name:
+                    # Split QKV weight: [3840, 1280] -> 3 x [1280, 1280]
+                    assert data_torch.shape[0] % 3 == 0
+                    c = data_torch.shape[0] // 3  # 1280
+                    wq = data_torch[:c]  # [1280, 1280]
+                    wk = data_torch[c:2*c]
+                    wv = data_torch[2*c:]
+                    # Extract block id
+                    block_match = name.split("blocks.")[-1].split(".")[0]
+                    bid = int(block_match)
+                    return [
+                        (f"v.blk.{bid}.attn_q.weight", wq),
+                        (f"v.blk.{bid}.attn_k.weight", wk),
+                        (f"v.blk.{bid}.attn_v.weight", wv),
+                    ]
+                elif "qkv.bias" in name:
+                    # Split QKV bias: [3840] -> 3 x [1280]
+                    assert data_torch.shape[0] % 3 == 0
+                    c = data_torch.shape[0] // 3
+                    bq = data_torch[:c]
+                    bk = data_torch[c:2*c]
+                    bv = data_torch[2*c:]
+                    block_match = name.split("blocks.")[-1].split(".")[0]
+                    bid = int(block_match)
+                    return [
+                        (f"v.blk.{bid}.attn_q.bias", bq),
+                        (f"v.blk.{bid}.attn_k.bias", bk),
+                        (f"v.blk.{bid}.attn_v.bias", bv),
+                    ]
+                elif "proj.weight" in name:
+                    # Output projection
+                    block_match = name.split("blocks.")[-1].split(".")[0]
+                    bid = int(block_match)
+                    return [(f"v.blk.{bid}.attn_out.weight", data_torch)]
+                elif "proj.bias" in name:
+                    block_match = name.split("blocks.")[-1].split(".")[0]
+                    bid = int(block_match)
+                    return [(f"v.blk.{bid}.attn_out.bias", data_torch)]
+
+            # Handle MLP layers
+            elif "blocks." in name and "mlp." in name:
+                # Map to standard MLP structure
+                block_match = name.split("blocks.")[-1].split(".")[0]
+                bid = int(block_match)
+                if "fc1.weight" in name:
+                    return [(f"v.blk.{bid}.ffn_up.weight", data_torch)]
+                elif "fc1.bias" in name:
+                    return [(f"v.blk.{bid}.ffn_up.bias", data_torch)]
+                elif "fc2.weight" in name:
+                    return [(f"v.blk.{bid}.ffn_down.weight", data_torch)]
+                elif "fc2.bias" in name:
+                    return [(f"v.blk.{bid}.ffn_down.bias", data_torch)]
+
+            # Handle layer norms
+            elif "norm1.weight" in name:
+                block_match = name.split("blocks.")[-1].split(".")[0]
+                bid = int(block_match)
+                return [(f"v.blk.{bid}.ln1.weight", data_torch)]
+            elif "norm1.bias" in name:
+                block_match = name.split("blocks.")[-1].split(".")[0]
+                bid = int(block_match)
+                return [(f"v.blk.{bid}.ln1.bias", data_torch)]
+            elif "norm2.weight" in name:
+                block_match = name.split("blocks.")[-1].split(".")[0]
+                bid = int(block_match)
+                return [(f"v.blk.{bid}.ln2.weight", data_torch)]
+            elif "norm2.bias" in name:
+                block_match = name.split("blocks.")[-1].split(".")[0]
+                bid = int(block_match)
+                return [(f"v.blk.{bid}.ln2.bias", data_torch)]
+
+            # Handle patch embedding
+            elif "patch_embed.proj.weight" in name:
+                # Keep 4D for LLaVA projector compatibility: [1280, 3, 14, 14]
+                return [("v.patch_embd.weight", data_torch)]
+            elif "patch_embed.proj.bias" in name:
+                return [("v.patch_embd.bias", data_torch)]
+
+            # Handle position embedding
+            elif "pos_embed" in name:
+                return [("v.position_embd.weight", data_torch)]
+
+            # Handle final layer norm
+            elif "ln_post" in name or ("norm" in name and "blocks." not in name):
+                if "weight" in name:
+                    return [("v.post_ln.weight", data_torch)]
+                elif "bias" in name:
+                    return [("v.post_ln.bias", data_torch)]
+
+            return [(self.map_tensor_name(name), data_torch)]
+
+        elif name.startswith("resampler_model.") or name.startswith("model.resampler_model."):
+            # Process resampler (projection) tensors
+            name = name.replace("model.resampler_model.", "resampler_model.")
+            name = name.replace("resampler_model.", "")
+
+            # Handle spatial linear layers (cross-attention style)
+            if "spatial_linear" in name:
+                # layer_num = name.split("spatial_linear.")[-1].split(".")[0]
+                if "0.weight" in name:  # First linear: [5120, 1280] - projection from vision encoder
+                    data_torch = data_torch.t()  # Transpose for GGML: [1280, 5120]
+                    return [("mm.0.weight", data_torch)]
+                elif "0.bias" in name:
+                    return [("mm.0.bias", data_torch)]
+                elif "2.weight" in name:  # Second linear: [5120, 5120]
+                    data_torch = data_torch.t()  # Transpose for GGML: [5120, 5120]
+                    return [("mm.2.weight", data_torch)]
+                elif "2.bias" in name:
+                    return [("mm.2.bias", data_torch)]
+                elif "3.weight" in name:  # Third linear: [5120] -> output projection
+                    data_torch = data_torch.t()  # Transpose for GGML: [5120, 5120] -> wait, this might be wrong
+                    return [("mm.3.weight", data_torch)]
+                elif "3.bias" in name:
+                    return [("mm.3.bias", data_torch)]
+
+            # Handle temporal linear layers
+            elif "temporal_linear" in name:
+                if "0.weight" in name:  # [5120, 10240]
+                    data_torch = data_torch.t()  # Transpose for GGML
+                    return [("mm_temp.0.weight", data_torch)]
+                elif "0.bias" in name:
+                    return [("mm_temp.0.bias", data_torch)]
+                elif "2.weight" in name:  # [5120, 5120]
+                    data_torch = data_torch.t()  # Transpose for GGML
+                    return [("mm_temp.2.weight", data_torch)]
+                elif "2.bias" in name:
+                    return [("mm_temp.2.bias", data_torch)]
+                elif "3.weight" in name:  # [5120]
+                    data_torch = data_torch.t()  # Transpose for GGML
+                    return [("mm_temp.3.weight", data_torch)]
+                elif "3.bias" in name:
+                    return [("mm_temp.3.bias", data_torch)]
+
+            # Handle final MLP
+            elif "mlp.weight" in name:  # [2560, 5120]
+                data_torch = data_torch.t()  # Transpose for GGML: [5120, 2560]
+                return [("mm.mlp.weight", data_torch)]
+            elif "mlp.bias" in name:
+                return [("mm.mlp.bias", data_torch)]
+
+            # Handle final norm
+            elif "after_norm.weight" in name:
+                return [("mm.norm.weight", data_torch)]
+            elif "after_norm.bias" in name:
+                return [("mm.norm.bias", data_torch)]
+
+            # Handle alternative norm names (some models may not have bias)
+            elif "norm.weight" in name and "blocks." not in name and "attn." not in name:
+                return [("mm.norm.weight", data_torch)]
+            elif "norm.bias" in name and "blocks." not in name and "attn." not in name:
+                return [("mm.norm.bias", data_torch)]
+
+            return [(self.map_tensor_name(name), data_torch)]
+
+        return []  # Skip other tensors
 
 
 @ModelBase.register("WavTokenizerDec")

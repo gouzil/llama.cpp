@@ -428,6 +428,7 @@ class MODEL_ARCH(IntEnum):
     AFMOE            = auto()
     ERNIE4_5         = auto()
     ERNIE4_5_MOE     = auto()
+    ERNIE4_5_VL_MOE  = auto()
     HUNYUAN_MOE      = auto()
     HUNYUAN_DENSE    = auto()
     SMOLLM3          = auto()
@@ -801,6 +802,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.AFMOE:            "afmoe",
     MODEL_ARCH.ERNIE4_5:         "ernie4_5",
     MODEL_ARCH.ERNIE4_5_MOE:     "ernie4_5-moe",
+    MODEL_ARCH.ERNIE4_5_VL_MOE:  "ernie4_5-vl-moe",
     MODEL_ARCH.FALCON_H1:        "falcon-h1",
     MODEL_ARCH.HUNYUAN_MOE:      "hunyuan-moe",
     MODEL_ARCH.HUNYUAN_DENSE:    "hunyuan-dense",
@@ -2344,6 +2346,28 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
     ],
+    MODEL_ARCH.ERNIE4_5_VL_MOE: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+    ],
     MODEL_ARCH.PLM: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT,
@@ -3327,6 +3351,7 @@ class VisionProjectorType:
     LIGHTONOCR = "lightonocr"
     COGVLM = "cogvlm"
     JANUS_PRO = "janus_pro"
+    ERNIE45VL = "ernie4.5vl"
 
 
 # Items here are (block size, type size)

@@ -377,6 +377,7 @@ class TensorNameMap:
             "model.layers.{bid}.feed_forward.gate",               # lfm2moe
             "model.layers.{bid}.mlp.router.gate",               # afmoe
             "layers.{bid}.gate",                                # mistral-large
+            "model.layers.{bid}.mlp.gate.weight_1"              # ernie4.5vl-moe
         ),
 
         MODEL_TENSOR.FFN_GATE_INP_SHEXP: (

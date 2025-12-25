@@ -119,6 +119,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_8B_A1B:        return "8B.A1B";
         case LLM_TYPE_16B_A1B:       return "16B.A1B";
         case LLM_TYPE_21B_A3B:       return "21B.A3B";
+        case LLM_TYPE_28B_A3B:       return "28B.A3B";
         case LLM_TYPE_30B_A3B:       return "30B.A3B";
         case LLM_TYPE_80B_A3B:       return "80B.A3B";
         case LLM_TYPE_100B_A6B:      return "100B.A6B";
@@ -2055,6 +2056,19 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     case 18: type = LLM_TYPE_0_3B; break;
                     case 28: type = LLM_TYPE_21B_A3B; break;
                     case 54: type = LLM_TYPE_300B_A47B; break;
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_ERNIE4_5_VL_MOE:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                ml.get_key(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,         hparams.n_moe_layer_step);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead);
+
+                switch (hparams.n_layer) {
+                    case 28: type = LLM_TYPE_28B_A3B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
@@ -5981,6 +5995,58 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         }
                     }
                 } break;
+            case LLM_ARCH_ERNIE4_5_VL_MOE:
+            {
+                tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                // output
+                output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                // if output is NULL, init from the input tok embed
+                if (output == NULL) {
+                    output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                }
+
+                for (int i = 0; i < n_layer; ++i) {
+                    auto & layer = layers[i];
+
+                    layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+                    layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+                    layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa}, 0);
+                    layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa}, 0);
+                    layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+                    // optional bias tensors
+                    layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd},     TENSOR_NOT_REQUIRED);
+                    layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_gqa}, TENSOR_NOT_REQUIRED);
+                    layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_gqa}, TENSOR_NOT_REQUIRED);
+                    layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd},     TENSOR_NOT_REQUIRED);
+
+                    layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+
+                    if (static_cast<uint32_t>(i) >= hparams.n_layer_dense_lead) { // MoE layers
+                        int n_ff_exp = hparams.n_ff_exp;
+
+                        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert}, 0);
+                        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff_exp, n_embd, n_expert}, 0);
+                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+
+                        // Shared expert (if present)
+                        if (hparams.n_ff_shexp > 0) {
+                            layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {    n_embd, hparams.n_ff_shexp}, 0);
+                            layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {hparams.n_ff_shexp, n_embd    }, 0);
+                            layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {    n_embd, hparams.n_ff_shexp}, 0);
+                        }
+                    } else { // Dense layers
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+                    }
+                }
+            } break;
             case LLM_ARCH_FALCON_H1:
                 {
                     // Common
@@ -7514,6 +7580,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_ernie4_5_moe>(*this, params);
             } break;
+        case LLM_ARCH_ERNIE4_5_VL_MOE:
+            {
+                llm = std::make_unique<llm_build_ernie4_5_vl_moe>(*this, params);
+            } break;
         case LLM_ARCH_HUNYUAN_MOE:
             {
                 llm = std::make_unique<llm_build_hunyuan_moe>(*this, params);
@@ -7809,6 +7879,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
             return LLAMA_ROPE_TYPE_MROPE;
         case LLM_ARCH_QWEN3VL:
         case LLM_ARCH_QWEN3VLMOE:
+        case LLM_ARCH_ERNIE4_5_VL_MOE:
             return LLAMA_ROPE_TYPE_IMROPE;
 
         // all model arches should be listed explicitly here
