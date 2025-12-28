@@ -62,6 +62,10 @@ struct clip_hparams {
     int32_t attn_window_size = 0;
     int32_t n_wa_pattern = 0;
 
+    int32_t spatial_conv_size = 2;
+    int32_t temporal_conv_size = 2;
+    bool use_temporal_conv = false;
+
     // audio
     int32_t n_mel_bins = 0; // whisper preprocessor
     int32_t proj_stack_factor = 0; // ultravox
@@ -199,6 +203,25 @@ struct clip_model {
     ggml_tensor * projection; // TODO: rename it to fc (fully connected layer)
     ggml_tensor * mm_fc_w;
     ggml_tensor * mm_fc_b;
+
+    // ernie4.5-vl-moe resampler projection
+    ggml_tensor * mm_spatial_0_w = nullptr;
+    ggml_tensor * mm_spatial_0_b = nullptr;
+    ggml_tensor * mm_spatial_2_w = nullptr;
+    ggml_tensor * mm_spatial_2_b = nullptr;
+    ggml_tensor * mm_spatial_norm_w = nullptr;
+    ggml_tensor * mm_spatial_norm_b = nullptr;
+
+    ggml_tensor * mm_temp_0_w = nullptr;
+    ggml_tensor * mm_temp_0_b = nullptr;
+    ggml_tensor * mm_temp_2_w = nullptr;
+    ggml_tensor * mm_temp_2_b = nullptr;
+    ggml_tensor * mm_temp_norm_w = nullptr;
+    ggml_tensor * mm_temp_norm_b = nullptr;
+
+    ggml_tensor * mm_mlp_w = nullptr;
+    ggml_tensor * mm_mlp_b = nullptr;
+    ggml_tensor * mm_after_norm_w = nullptr;
     ggml_tensor * mm_ffn_up_w = nullptr;
     ggml_tensor * mm_ffn_up_b = nullptr;
     ggml_tensor * mm_ffn_gate_w = nullptr;

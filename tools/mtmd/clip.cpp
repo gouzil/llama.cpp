@@ -829,6 +829,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             {
                 builder = std::make_unique<clip_graph_cogvlm>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_ERNIE45VLMOE:
+            {
+                builder = std::make_unique<clip_graph_ernie45vlmoe>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_LDP:
@@ -1133,6 +1137,34 @@ struct clip_model_loader {
                         hparams.set_limit_image_tokens(8, 1024);
                         hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
                     } break;
+                case PROJECTOR_TYPE_ERNIE45VLMOE:
+                {
+                    // spatial path
+                    model.mm_spatial_0_w    = get_tensor("mm.0.weight");
+                    model.mm_spatial_0_b    = get_tensor("mm.0.bias");
+                    model.mm_spatial_2_w    = get_tensor("mm.2.weight");
+                    model.mm_spatial_2_b    = get_tensor("mm.2.bias");
+                    model.mm_spatial_norm_w = get_tensor("mm.3.weight");
+                    model.mm_spatial_norm_b = get_tensor("mm.3.bias", false);
+
+                    // temporal path (optional, not used for single images)
+                    model.mm_temp_0_w    = get_tensor("mm_temp.0.weight", false);
+                    model.mm_temp_0_b    = get_tensor("mm_temp.0.bias",   false);
+                    model.mm_temp_2_w    = get_tensor("mm_temp.2.weight", false);
+                    model.mm_temp_2_b    = get_tensor("mm_temp.2.bias",   false);
+                    model.mm_temp_norm_w = get_tensor("mm_temp.3.weight", false);
+                    model.mm_temp_norm_b = get_tensor("mm_temp.3.bias",   false);
+
+                    // output
+                    model.mm_mlp_w        = get_tensor("mm.mlp.weight");
+                    model.mm_mlp_b        = get_tensor("mm.mlp.bias");
+                    model.mm_after_norm_w = get_tensor("mm.norm.weight");
+
+                    // defaults
+                    hparams.spatial_conv_size  = 2;
+                    hparams.temporal_conv_size = 2;
+                    hparams.use_temporal_conv  = model.mm_temp_0_w != nullptr;
+                } break;
                 case PROJECTOR_TYPE_GEMMA3:
                     {
                         // default value (used by all model sizes in gemma 3 family)
@@ -3405,6 +3437,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         case PROJECTOR_TYPE_VOXTRAL:
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_COGVLM:
+        case PROJECTOR_TYPE_ERNIE45VLMOE:
             {
                 // do nothing
             } break;
@@ -3540,6 +3573,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_COGVLM:
             return ctx->model.mm_4h_to_h_w->ne[1];
+        case PROJECTOR_TYPE_ERNIE45VLMOE:
+            return ctx->model.mm_mlp_w->ne[1];
         case PROJECTOR_TYPE_LFM2A:
             return ctx->model.position_embeddings->ne[0];
         case PROJECTOR_TYPE_GLM4V:

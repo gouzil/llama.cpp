@@ -4179,8 +4179,8 @@ class Ernie4_5VLVisionModel(MmprojModel):
         assert self.hparams_vision is not None
         hparams = self.hparams_vision
 
-        # Use a custom projector type for ERNIE-4.5-VL
-        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.ERNIE45VL)  # Use ERNIE-4.5-VL projector
+        # Use ERNIE-4.5-VL-MoE specific projector type
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.ERNIE45VLMOE)
 
         # Set vision parameters
         self.gguf_writer.add_vision_attention_layernorm_eps(1e-6)  # Default RMS norm eps
@@ -4281,7 +4281,11 @@ class Ernie4_5VLVisionModel(MmprojModel):
 
             # Handle patch embedding
             elif "patch_embed.proj.weight" in name:
-                # Keep 4D for LLaVA projector compatibility: [1280, 3, 14, 14]
+                # ERNIE-4.5-VL uses Linear layer [1280, 588], reshape to Conv2d format [1280, 3, 14, 14]
+                patch_size = self.hparams_vision.get("patch_size", 14)
+                if data_torch.dim() == 2 and data_torch.shape[1] == patch_size * patch_size * 3:
+                    # Reshape [out_features, in_features] to [out_features, 3, patch_size, patch_size]
+                    data_torch = data_torch.reshape(data_torch.shape[0], 3, patch_size, patch_size)
                 return [("v.patch_embd.weight", data_torch)]
             elif "patch_embed.proj.bias" in name:
                 return [("v.patch_embd.bias", data_torch)]
@@ -4307,20 +4311,19 @@ class Ernie4_5VLVisionModel(MmprojModel):
             # Handle spatial linear layers (cross-attention style)
             if "spatial_linear" in name:
                 # layer_num = name.split("spatial_linear.")[-1].split(".")[0]
-                if "0.weight" in name:  # First linear: [5120, 1280] - projection from vision encoder
-                    data_torch = data_torch.t()  # Transpose for GGML: [1280, 5120]
+                if "0.weight" in name:  # First linear: [5120, 5120]
+                    data_torch = data_torch.t()  # Transpose for GGML
                     return [("mm.0.weight", data_torch)]
                 elif "0.bias" in name:
                     return [("mm.0.bias", data_torch)]
                 elif "2.weight" in name:  # Second linear: [5120, 5120]
-                    data_torch = data_torch.t()  # Transpose for GGML: [5120, 5120]
+                    data_torch = data_torch.t()  # Transpose for GGML
                     return [("mm.2.weight", data_torch)]
                 elif "2.bias" in name:
                     return [("mm.2.bias", data_torch)]
-                elif "3.weight" in name:  # Third linear: [5120] -> output projection
-                    data_torch = data_torch.t()  # Transpose for GGML: [5120, 5120] -> wait, this might be wrong
+                elif "3.weight" in name:  # LayerNorm weight: [5120] - no transpose
                     return [("mm.3.weight", data_torch)]
-                elif "3.bias" in name:
+                elif "3.bias" in name:  # LayerNorm bias: [5120] - no transpose
                     return [("mm.3.bias", data_torch)]
 
             # Handle temporal linear layers
@@ -4335,10 +4338,9 @@ class Ernie4_5VLVisionModel(MmprojModel):
                     return [("mm_temp.2.weight", data_torch)]
                 elif "2.bias" in name:
                     return [("mm_temp.2.bias", data_torch)]
-                elif "3.weight" in name:  # [5120]
-                    data_torch = data_torch.t()  # Transpose for GGML
+                elif "3.weight" in name:  # LayerNorm weight: [5120] - no transpose
                     return [("mm_temp.3.weight", data_torch)]
-                elif "3.bias" in name:
+                elif "3.bias" in name:  # LayerNorm bias: [5120] - no transpose
                     return [("mm_temp.3.bias", data_torch)]
 
             # Handle final MLP
@@ -4348,11 +4350,9 @@ class Ernie4_5VLVisionModel(MmprojModel):
             elif "mlp.bias" in name:
                 return [("mm.mlp.bias", data_torch)]
 
-            # Handle final norm
+            # Handle final norm (RMSNorm)
             elif "after_norm.weight" in name:
                 return [("mm.norm.weight", data_torch)]
-            elif "after_norm.bias" in name:
-                return [("mm.norm.bias", data_torch)]
 
             # Handle alternative norm names (some models may not have bias)
             elif "norm.weight" in name and "blocks." not in name and "attn." not in name:
