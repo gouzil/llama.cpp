@@ -4191,6 +4191,7 @@ class Ernie4_5VLVisionModel(MmprojModel):
         self.gguf_writer.add_vision_patch_size(hparams["patch_size"])
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        assert self.hparams_vision is not None
         if name.startswith("vision_model.") or name.startswith("model.vision_model."):
             # Process vision encoder tensors
             name = name.replace("model.vision_model.", "vision_model.")
