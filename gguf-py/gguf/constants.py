@@ -3500,7 +3500,7 @@ class VisionProjectorType:
     JANUS_PRO = "janus_pro"
     LFM2A = "lfm2a" # audio
     GLM4V = "glm4v"
-    ERNIE45VL = "ernie4.5vl"
+    ERNIE45VLMOE = "ernie4.5vl_moe"
 
 
 # Items here are (block size, type size)
